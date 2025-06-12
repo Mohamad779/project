@@ -1,110 +1,78 @@
-#Importing OpenCV Library for basic image processing functions
 import cv2
-# Numpy for array related functions
 import numpy as np
-# Dlib for deep learning based Modules and face landmark detection
-import dlib
-#face_utils for basic operations of conversion
-from uuu import face_utils
+import mediapipe as mp
 import serial
 import time
-s = serial.Serial('COM1',9600)
 
+# serial port – adjust to yours
+s = serial.Serial('COM9', 9600, timeout=1)
 
-#Initializing the camera and taking the instance
-cap = cv2.VideoCapture(1)
+mp_face = mp.solutions.face_mesh
+face_mesh = mp_face.FaceMesh(static_image_mode=False,
+                             max_num_faces=1,
+                             refine_landmarks=True,
+                             min_detection_confidence=0.5,
+                             min_tracking_confidence=0.5)
 
-#Initializing the face detector and landmark detector
-hog_face_detector = dlib.get_frontal_face_detector()
-predictor = dlib.shape_predictor("shape_predictor_68_face_landmarks.dat")
+# indices for left/right eye in MediaPipe FaceMesh
+LEFT_EYE = [33, 160, 158, 133, 153, 144]
+RIGHT_EYE = [362, 385, 387, 263, 373, 380]
 
-#status marking for current state
-sleep = 0
-drowsy = 0
-active = 0
-status=""
-color=(0,0,0)
+def eye_aspect_ratio(landmarks, pts):
+    # compute vertical/horizontal distances
+    a = np.linalg.norm(landmarks[pts[1]] - landmarks[pts[5]])
+    b = np.linalg.norm(landmarks[pts[2]] - landmarks[pts[4]])
+    c = np.linalg.norm(landmarks[pts[0]] - landmarks[pts[3]])
+    return (a + b) / (2.0 * c)
 
-def compute(ptA,ptB):
-	dist = np.linalg.norm(ptA - ptB)
-	return dist
-
-def blinked(a,b,c,d,e,f):
-	up = compute(b,d) + compute(c,e)
-	down = compute(a,f)
-	ratio = up/(2.0*down)
-
-	#Checking if it is blinked
-	if(ratio>0.25):
-		return 2
-	elif(ratio>0.21 and ratio<=0.25):
-		return 1
-	else:
-		return 0
-
+cap = cv2.VideoCapture(0)
+sleep = drowsy = active = 0
 
 while True:
-        _, frame = cap.read()
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    ret, frame = cap.read()
+    if not ret:
+        break
 
-        faces = hog_face_detector(gray)
-        #detected face in faces array
-        for face in faces:
-                x1 = face.left()
-                y1 = face.top()
-                x2 = face.right()
-                y2 = face.bottom()
-                face_frame = frame.copy()
-                cv2.rectangle(face_frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+    img_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    result = face_mesh.process(img_rgb)
 
-                landmarks = predictor(gray, face)
-                landmarks = face_utils.shape_to_np(landmarks)
+    status = ""
+    color = (0, 255, 0)
 
-                #The numbers are actually the landmarks which will show eye
-                left_blink = blinked(landmarks[36],landmarks[37], 
-                landmarks[38], landmarks[41], landmarks[40], landmarks[39])
-                right_blink = blinked(landmarks[42],landmarks[43], 
-                landmarks[44], landmarks[47], landmarks[46], landmarks[45])
+    if result.multi_face_landmarks:
+        mesh = result.multi_face_landmarks[0]
+        h, w, _ = frame.shape
+        pts = [(int(p.x * w), int(p.y * h)) for p in mesh.landmark]
 
-                #Now judge what to do for the eye blinks
-                if(left_blink==0 or right_blink==0):
-                        sleep+=1
-                        drowsy=0
-                        active=0
-                        if(sleep>6):
-                                s.write(b'a')
-                                time.sleep(2)
-                                status="SLEEPING !!!"
-                                color = (0,0,255)
+        left_ear = eye_aspect_ratio(np.array(pts), LEFT_EYE)
+        right_ear = eye_aspect_ratio(np.array(pts), RIGHT_EYE)
 
-                elif(left_blink==1 or right_blink==1):
-                        sleep=0
-                        active=0
-                        drowsy+=1
-                        if(drowsy>6):
-                                s.write(b'a')
-                                time.sleep(2)
-                                status="Drowsy !"
-                                color = (0,0,255)
+        # tuned thresholds
+        if left_ear < 0.2 and right_ear < 0.2:
+            sleep += 1; drowsy = active = 0
+            if sleep > 6:
+                s.write(b'a'); time.sleep(0.1)
+                status, color = "SLEEPING !!!", (0, 0, 255)
 
-                else:
-                        drowsy=0
-                        sleep=0
-                        active+=1
-                        if(active>6):
-                                s.write(b'b')
-                                time.sleep(2)
-                                status="Active :)"
-                                color = (0,0,255)
+        elif left_ear < 0.25 or right_ear < 0.25:
+            drowsy += 1; sleep = active = 0
+            if drowsy > 6:
+                s.write(b'a'); time.sleep(0.1)
+                status, color = "Drowsy !", (0, 0, 255)
 
-                cv2.putText(frame, status, (100,100), cv2.FONT_HERSHEY_SIMPLEX, 1.2, color,3)
+        else:
+            active += 1; sleep = drowsy = 0
+            if active > 6:
+                s.write(b'b'); time.sleep(0.1)
+                status, color = "Active :)", (0, 255, 0)
 
-                for n in range(0, 68):
-                        (x,y) = landmarks[n]
-                        cv2.circle(face_frame, (x, y), 1, (255, 255, 255), -1)
+        # draw status
+        cv2.putText(frame, status, (30, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1, color, 2)
 
-        cv2.imshow("Frame", frame)
-        cv2.imshow("Result of detector", face_frame)
-        key = cv2.waitKey(1)
-        if key == 27:
-                break
+    cv2.imshow("Blink Detection", frame)
+    if cv2.waitKey(1) & 0xFF == 27:
+        break
+
+cap.release()
+cv2.destroyAllWindows()
